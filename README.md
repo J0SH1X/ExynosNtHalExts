@@ -4,14 +4,19 @@ HAL extensions for ARMv7 NT on the Samsung Galaxy Note (GT-N7000, Exynos4210). F
 You need correct `CSRT` ACPI tables to load these (Exynos441xPkg provides them).
 
 ## halextmct
-HAL extension for the Exynos4 Multi-Core Timer (MCT). The Cortex-A9 has no ARM generic timer, so the HAL gets the MCT instead:
+HAL extension for the Samsung Exynos Multi-Core Timer (MCT), for SoCs where the HAL has no usable ARM generic timer (Exynos4's Cortex-A9 has none; Exynos5 firmware leaves CNTFRQ unprogrammed):
 
-- counter: the free-running 64-bit global counter (`G_CNT`, 24 MHz)
-- interrupt timer: global comparator 0 (`G_COMP0`, SPI 57 = GSI 89), one-shot and pseudo-periodic
+- counter: the free-running 64-bit global counter (`G_CNT`)
+- interrupt timer: global comparator 0 (`G_COMP0`), one-shot and pseudo-periodic
 
 Only one processor is covered, like Linux's `mct-comp` clock event on CPU0.
 
-Loaded for the CSRT resource group with VendorId `SAMS`, DeviceId `0x4210` (`OSExtensionDatabase\VEN_SAMS&DEV_4210`). Tested on Windows RT 8.1 (9600), booting `boot.wim` from a RAM disk.
+One DLL for every Exynos: the firmware describes the MCT in the CSRT resource group (VendorId `SAMS`, DeviceId = SoC, e.g. `0x5420` → `OSExtensionDatabase\VEN_SAMS&DEV_5420`):
+
+- a timer resource descriptor (Type 2, Subtype 0): MCT base, size, counter frequency, `G_COMP0` GSI
+- optionally, in the group's shared info: version 1, base and size of an uncached OS log ring for breadcrumbs (`usbdbg.py oslog`)
+
+Exynos5420Pkg (v1awifi) provides such a CSRT: MCT at `0x101C0000`, 24 MHz, `G_COMP0` via interrupt combiner 23.3 = GSI 55.  Exynos441xPkg still has the old descriptor-less group and needs the timer descriptor added (MCT at `0x10050000`, GSI 89).
 
 ### Building (Linux, no Visual Studio)
 Needs clang, lld-link and osslsigncode, plus the Windows SDK and MSVC CRT headers, e.g. from [xwin](https://github.com/Jake-Shadle/xwin):

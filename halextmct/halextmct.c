@@ -1,14 +1,20 @@
-// HAL extension for the Samsung Exynos4 Multi-Core Timer (MCT).
+// HAL extension for the Samsung Exynos Multi-Core Timer (MCT).
 //
-// The Cortex-A9 in the Exynos4210 has no ARM generic timer, so the HAL needs
-// the MCT instead. Two timers are registered, like halextgit does for the
-// generic timer:
+// Exynos4 (Cortex-A9) has no ARM generic timer, and on Exynos5 the firmware
+// leaves CNTFRQ unprogrammed, so the HAL gets the MCT instead.  Two timers
+// are registered, like halextgit does for the generic timer:
 //   - the free-running 64-bit global counter (G_CNT) as the counter,
-//   - global comparator 0 (G_COMP0, SPI 57 = GSI 89) as the interrupt timer.
-// This is what Linux uses on the 4210 for its clocksource and CPU0 clock
-// event (arch/arm/mach-exynos/mct.c), so it only covers one processor.
+//   - global comparator 0 (G_COMP0) as the interrupt timer.
+// This is what Linux uses for its clocksource and CPU0 clock event
+// (arch/arm/mach-exynos/mct.c), so it only covers one processor.
 //
-// CSRT resource group: VendorId 'SAMS', DeviceId 0x4210.
+// SoC independent: the firmware describes the MCT in the CSRT resource group
+// (VendorId 'SAMS', DeviceId = the SoC, e.g. 0x5420; the DeviceId only picks
+// the OSExtensionDatabase entry):
+//   - a timer descriptor (Type 2 / Subtype 0) with the MCT's physical base,
+//     size, counter frequency and the GSI of G_COMP0 (MCT_CSRT_TIMER),
+//   - optionally, in the group's shared info, an uncached OS log ring for
+//     these breadcrumbs (MCT_CSRT_SHARED_INFO).
 
 #include "halext.h"
 #include <arm_acle.h>
@@ -24,36 +30,56 @@
 #endif
 #define MCT_LOAD_TEST_BUGCHECK 0x4D435421
 
-// OS log ring (Exynos441xPkg ExynosOsLog.h): firmware keeps it across warm
-// resets, read back with `usbdbg.py oslog`.  Uncached, single CPU.
-#define OS_LOG_BASE 0x5E900000
-#define OS_LOG_SIZE 0x00080000
-#define OS_LOG_MAGIC 0x474C534F
-#define OS_LOG_DATA_SIZE (OS_LOG_SIZE - 16)
+// CSRT contents, as the firmware lays them out (Exynos5420Pkg Csrt.aslc).
+#pragma pack(push, 1)
+typedef struct _MCT_CSRT_TIMER {
+	CSRT_RESOURCE_DESCRIPTOR_HEADER Header; // Type 2, Subtype 0, Uid 0
+	ULONG BaseAddress;                      // MCT registers (physical)
+	ULONG Size;
+	ULONG Frequency;                        // G_CNT input clock, Hz
+	ULONG ComparatorGsi;                    // G_COMP0 interrupt (GIC INTID)
+} MCT_CSRT_TIMER, *PMCT_CSRT_TIMER;
 
+typedef struct _MCT_CSRT_SHARED_INFO {
+	ULONG Version;                          // 1
+	ULONG OsLogBase;                        // 0: no log ring
+	ULONG OsLogSize;
+} MCT_CSRT_SHARED_INFO, *PMCT_CSRT_SHARED_INFO;
+#pragma pack(pop)
+
+// OS log ring (ExynosOsLog.h): firmware keeps it across warm resets, read
+// back with `usbdbg.py oslog`.  Uncached, single CPU.  Location from the CSRT.
+#define OS_LOG_MAGIC 0x474C534F
+
+static ULONG s_OsLogBase;
+static ULONG s_OsLogSize;
 static volatile ULONG* s_OsLog;
 
 static void OsLog(const char* Text) {
 	if (s_OsLog == NULL) {
+		if ((s_OsLogBase == 0) || (s_OsLogSize <= 16)) return;
 		PHYSICAL_ADDRESS Phys;
-		Phys.QuadPart = OS_LOG_BASE;
-		s_OsLog = (volatile ULONG*)HalMapIoSpace(Phys, OS_LOG_SIZE, MmNonCached);
+		Phys.QuadPart = s_OsLogBase;
+		s_OsLog = (volatile ULONG*)HalMapIoSpace(Phys, s_OsLogSize, MmNonCached);
 		if (s_OsLog == NULL) return;
 	}
+	const ULONG DataSize = s_OsLogSize - 16;
 	if (s_OsLog[0] != OS_LOG_MAGIC) {
 		s_OsLog[1] = 0;
 		s_OsLog[0] = OS_LOG_MAGIC;
 	}
 	volatile UCHAR* Data = (volatile UCHAR*)&s_OsLog[4];
 	ULONG Head = s_OsLog[1];
-	for (; *Text != 0; Text++, Head++) Data[Head % OS_LOG_DATA_SIZE] = (UCHAR)*Text;
+	// No division: on ARM that pulls the CRT divide helper (and with it
+	// __security_cookie) out of ntoskrnl.lib.
+	ULONG Index = Head;
+	while (Index >= DataSize) Index -= DataSize;
+	for (; *Text != 0; Text++, Head++) {
+		Data[Index] = (UCHAR)*Text;
+		if (++Index == DataSize) Index = 0;
+	}
 	s_OsLog[1] = Head;
 }
-
-#define MCT_PHYS 0x10050000
-#define MCT_SIZE 0x1000
-#define MCT_FREQUENCY 24000000 // XUSBXTI
-#define MCT_G0_GSIV 89
 
 #define MCT_G_CNT_L 0x100
 #define MCT_G_CNT_U 0x104
@@ -82,6 +108,8 @@ typedef enum _MCT_TIMER_TYPE {
 typedef struct _MCT_INTERNAL_DATA
 {
 	MCT_TIMER_TYPE Type;
+	ULONG Phys;
+	ULONG Size;
 	volatile UCHAR* Base;
 	TIMER_MODE Mode;
 	ULONGLONG LastCompareValue;
@@ -139,8 +167,8 @@ static void MctComparatorStop(PMCT_INTERNAL_DATA TimerData) {
 NTSTATUS MctInitialize(PMCT_INTERNAL_DATA TimerData) {
 	if (TimerData->Base == NULL) {
 		PHYSICAL_ADDRESS MctPhys;
-		MctPhys.QuadPart = MCT_PHYS;
-		TimerData->Base = (volatile UCHAR*)HalMapIoSpace(MctPhys, MCT_SIZE, MmNonCached);
+		MctPhys.QuadPart = TimerData->Phys;
+		TimerData->Base = (volatile UCHAR*)HalMapIoSpace(MctPhys, TimerData->Size, MmNonCached);
 		if (TimerData->Base == NULL) return STATUS_INSUFFICIENT_RESOURCES;
 	}
 
@@ -219,6 +247,25 @@ AddResourceGroup (
 	KeBugCheckEx(MCT_LOAD_TEST_BUGCHECK, ResourceGroup->VendorId, ResourceGroup->DeviceId, Handle, 0);
 #endif
 
+	// Shared info (optional): where the OS log ring is.
+	if (ResourceGroup->SharedInfoLength >= sizeof(MCT_CSRT_SHARED_INFO)) {
+		PMCT_CSRT_SHARED_INFO Info = (PMCT_CSRT_SHARED_INFO)(ResourceGroup + 1);
+		if (Info->Version >= 1) {
+			s_OsLogBase = Info->OsLogBase;
+			s_OsLogSize = Info->OsLogSize;
+		}
+	}
+
+	// The MCT itself: without its timer descriptor there is nothing to drive.
+	PMCT_CSRT_TIMER Mct = (PMCT_CSRT_TIMER)GetNextResourceDescriptor(
+		Handle, ResourceGroup, NULL, CSRT_RD_TYPE_TIMER, CSRT_RD_SUBTYPE_TIMER, CSRT_RD_UID_ANY);
+	if ((Mct == NULL) || (Mct->Header.Length < sizeof(MCT_CSRT_TIMER)) ||
+	    (Mct->BaseAddress == 0) || (Mct->Size == 0) || (Mct->Frequency == 0)) {
+		OsLog("halextmct: no MCT timer descriptor in the CSRT group\n");
+		return STATUS_UNSUCCESSFUL;
+	}
+	OsLog("halextmct: MCT from CSRT\n");
+
 	NewTimer.Header.TableVersion = 1;
 	NewTimer.Header.TableSize = sizeof(NewTimer);
 	NewTimer.Capabilities = TIMER_COUNTER_READABLE;
@@ -226,7 +273,7 @@ AddResourceGroup (
 	// If this HAL doesn't know the flag, register without it.
 	NewTimer.Capabilities |= 0x8000;
 	NewTimer.CounterBitWidth = 64;
-	NewTimer.CounterFrequency = MCT_FREQUENCY;
+	NewTimer.CounterFrequency = Mct->Frequency;
 	NewTimer.FunctionTable.Initialize = (PTIMER_INITIALIZE)MctInitialize;
 	NewTimer.FunctionTable.QueryCounter = (PTIMER_QUERY_COUNTER)MctQueryCounter;
 	NewTimer.InternalData = &Data;
@@ -235,6 +282,8 @@ AddResourceGroup (
 	NewTimer.MaxDivisor = 1;
 	NewTimer.Identifier = 0;
 	Data.Type = MctTimerCounter;
+	Data.Phys = Mct->BaseAddress;
+	Data.Size = Mct->Size;
 	NTSTATUS Status = HextRegisterTimer(Handle, ResourceGroup, &NewTimer);
 	if (!NT_SUCCESS(Status)) {
 		NewTimer.Capabilities &= ~0x8000;
@@ -242,7 +291,7 @@ AddResourceGroup (
 		if (!NT_SUCCESS(Status)) return Status;
 	}
 
-	NewTimer.Interrupt.Gsi = MCT_G0_GSIV;
+	NewTimer.Interrupt.Gsi = Mct->ComparatorGsi;
 	NewTimer.Interrupt.Polarity = InterruptActiveHigh;
 	NewTimer.Interrupt.Mode = LevelSensitive;
 	NewTimer.Capabilities = TIMER_PSEUDO_PERIODIC_CAPABLE | TIMER_ONE_SHOT_CAPABLE | TIMER_GENERATES_LINE_BASED_INTERRUPTS;

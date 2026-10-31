@@ -7,3 +7,6 @@ Windows Registry Editor Version 5.00
 
 [HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\OSExtensionDatabase\VEN_SAMS&DEV_4210]
 "HALExtension"="halextmct.dll"
+
+[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Control\OSExtensionDatabase\VEN_SAMS&DEV_5420]
+"HALExtension"="halextmct.dll"
