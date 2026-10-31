@@ -24,6 +24,32 @@
 #endif
 #define MCT_LOAD_TEST_BUGCHECK 0x4D435421
 
+// OS log ring (Exynos441xPkg ExynosOsLog.h): firmware keeps it across warm
+// resets, read back with `usbdbg.py oslog`.  Uncached, single CPU.
+#define OS_LOG_BASE 0x5E900000
+#define OS_LOG_SIZE 0x00080000
+#define OS_LOG_MAGIC 0x474C534F
+#define OS_LOG_DATA_SIZE (OS_LOG_SIZE - 16)
+
+static volatile ULONG* s_OsLog;
+
+static void OsLog(const char* Text) {
+	if (s_OsLog == NULL) {
+		PHYSICAL_ADDRESS Phys;
+		Phys.QuadPart = OS_LOG_BASE;
+		s_OsLog = (volatile ULONG*)HalMapIoSpace(Phys, OS_LOG_SIZE, MmNonCached);
+		if (s_OsLog == NULL) return;
+	}
+	if (s_OsLog[0] != OS_LOG_MAGIC) {
+		s_OsLog[1] = 0;
+		s_OsLog[0] = OS_LOG_MAGIC;
+	}
+	volatile UCHAR* Data = (volatile UCHAR*)&s_OsLog[4];
+	ULONG Head = s_OsLog[1];
+	for (; *Text != 0; Text++, Head++) Data[Head % OS_LOG_DATA_SIZE] = (UCHAR)*Text;
+	s_OsLog[1] = Head;
+}
+
 #define MCT_PHYS 0x10050000
 #define MCT_SIZE 0x1000
 #define MCT_FREQUENCY 24000000 // XUSBXTI
@@ -126,6 +152,9 @@ NTSTATUS MctInitialize(PMCT_INTERNAL_DATA TimerData) {
 
 	if (TimerData->Type == MctTimerInterrupts) {
 		MctComparatorStop(TimerData);
+		OsLog("halextmct: comparator initialized\n");
+	} else {
+		OsLog("halextmct: counter initialized\n");
 	}
 	return STATUS_SUCCESS;
 }
@@ -135,6 +164,11 @@ ULONGLONG MctQueryCounter(PMCT_INTERNAL_DATA TimerData) {
 }
 
 NTSTATUS MctArmTimer(PMCT_INTERNAL_DATA TimerData, TIMER_MODE Mode, ULONGLONG TickCount) {
+	static BOOLEAN s_Armed;
+	if (!s_Armed) {
+		s_Armed = TRUE;
+		OsLog("halextmct: comparator armed\n");
+	}
 	TimerData->PeriodicInterval = TickCount;
 	ULONGLONG CompareValue = MctReadCounter(TimerData) + TickCount;
 	TimerData->LastCompareValue = CompareValue;
