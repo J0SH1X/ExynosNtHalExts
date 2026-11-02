@@ -9,10 +9,12 @@
 //
 // Per controller the group has one DMA controller descriptor (Type 3,
 // Subtype 1, PL330_CSRT_CONTROLLER): base, size, GSI, channel count, the
-// system-unique request line range, and per peripheral the FIFO access
-// width.  The HAL allocates a non-cached common buffer per channel
-// (ReportCommonBuffer); ProgramChannel writes the channel's PL330 program
-// there and starts it with DMAGO (non-secure) through the debug interface.
+// system-unique request line range, per peripheral the FIFO access width,
+// and a firmware-reserved memory range for the channel programs (1 KiB
+// each; mapped uncached here, so no HAL common buffers are needed), plus one
+// DMA channel descriptor (Type 3, Subtype 0) per channel.  ProgramChannel
+// writes the channel's PL330 program there and starts it with DMAGO
+// (non-secure) through the debug interface.
 //
 // The DMA extension interface is version 1 as Windows 8 RTM introduced it
 // (WDK nthalext.h: DMA_INITIALIZATION_BLOCK with SOC_INITIALIZATION_HEADER,
@@ -129,6 +131,8 @@ typedef struct _PL330_CSRT_CONTROLLER {
 	ULONG RequestLineBase;                  // system-unique request line of peripheral 0
 	ULONG RequestLineCount;                 // peripherals (<= 32)
 	UCHAR PeripheralWidth[PL330_MAX_PERIPHERALS]; // bytes per FIFO access (1, 2, 4); 0 = 4
+	ULONG ProgramBase;                      // reserved memory for channel programs
+	ULONG ProgramSize;                      // >= ChannelCount * PL330_PROGRAM_BYTES
 } PL330_CSRT_CONTROLLER, *PPL330_CSRT_CONTROLLER;
 #pragma pack(pop)
 
@@ -190,8 +194,11 @@ static void OsLogHex(const char* Text, ULONG Value) {
 #define PL330_INTEN        0x020
 #define PL330_INTSTATUS    0x028
 #define PL330_INTCLR       0x02C
+#define PL330_FSRD         0x030
 #define PL330_FSRC         0x034
+#define PL330_FTR(c)       (0x040 + (c) * 4)
 #define PL330_CSR(c)       (0x100 + (c) * 8)
+#define PL330_CPC(c)       (0x104 + (c) * 8)
 #define PL330_SAR(c)       (0x400 + (c) * 0x20)
 #define PL330_DAR(c)       (0x404 + (c) * 0x20)
 #define PL330_DBGSTATUS    0xD00
@@ -208,7 +215,7 @@ static void OsLogHex(const char* Text, ULONG Value) {
 #define DMALP(lc)          (0x20 | ((lc) << 1))
 #define DMALDPS            0x25
 #define DMASTPS            0x29
-#define DMALPFE            0x28
+#define DMALPFE            0x2C     // DMALPEND nf=0; lc must be 1 (Samsung pl330.c _loop_infiniteloop), 0x28 is undefined
 #define DMALPEND(lc)       (0x38 | ((lc) << 2))
 #define DMAWFPS            0x30
 #define DMASEV             0x34
@@ -254,6 +261,8 @@ typedef struct _PL330_CONTROLLER {
 	ULONG RequestLineBase;
 	ULONG RequestLineCount;
 	UCHAR PeripheralWidth[PL330_MAX_PERIPHERALS];
+	ULONG ProgramPhys;
+	ULONG ProgramSize;
 	PL330_CHANNEL Channel[PL330_MAX_CHANNELS];
 } PL330_CONTROLLER, *PPL330_CONTROLLER;
 
@@ -379,6 +388,8 @@ static ULONG WidthShift(ULONG Width) {
 static VOID Pl330InitializeController(PVOID Context) {
 	PPL330_CONTROLLER C = (PPL330_CONTROLLER)Context;
 	PHYSICAL_ADDRESS Phys;
+	volatile UCHAR* Programs;
+	ULONG Channel;
 
 	if (C->Base == NULL) {
 		Phys.QuadPart = C->Phys;
@@ -386,6 +397,20 @@ static VOID Pl330InitializeController(PVOID Context) {
 	}
 	if (C->Base == NULL) {
 		OsLog("halextpl330: cannot map the controller\n");
+	}
+
+	// Channel programs: the firmware's reserved range, uncached.
+	if ((C->ProgramPhys != 0) && (C->Channel[0].Program == NULL)) {
+		Phys.QuadPart = C->ProgramPhys;
+		Programs = (volatile UCHAR*)HalMapIoSpace(Phys, C->ProgramSize, MmNonCached);
+		if (Programs == NULL) {
+			OsLog("halextpl330: cannot map the program memory\n");
+			return;
+		}
+		for (Channel = 0; Channel < C->ChannelCount; Channel++) {
+			C->Channel[Channel].Program = Programs + Channel * PL330_PROGRAM_BYTES;
+			C->Channel[Channel].ProgramPhys = C->ProgramPhys + Channel * PL330_PROGRAM_BYTES;
+		}
 	}
 }
 
@@ -520,6 +545,15 @@ static BOOLEAN Pl330HandleInterrupt(PVOID Context, PULONG Channel, DMA_INTERRUPT
 	Pending = Rd(C, PL330_INTSTATUS) & ((1u << C->ChannelCount) - 1);
 	for (Index = 0; Index < C->ChannelCount; Index++) {
 		if ((Faults & (1u << Index)) != 0) {
+			static ULONG s_FaultLogs;
+			if (s_FaultLogs < 8) {
+				s_FaultLogs++;
+				OsLogHex("halextpl330: channel fault ", Index);
+				OsLogHex("halextpl330:   FTR (reason) ", Rd(C, PL330_FTR(Index)));
+				OsLogHex("halextpl330:   CPC (instruction) ", Rd(C, PL330_CPC(Index)));
+				OsLogHex("halextpl330:   CSR ", Rd(C, PL330_CSR(Index)));
+				OsLogHex("halextpl330:   DAR ", Rd(C, PL330_DAR(Index)));
+			}
 			KillChannel(C, Index);
 			*Channel = Index;
 			*Type = DmaInterruptError;
@@ -547,6 +581,7 @@ static ULONG Pl330ReadDmaCounter(PVOID Context, ULONG Channel) {
 
 	if (!C->Ready || (Channel >= C->ChannelCount)) return 0;
 	Ch = &C->Channel[Channel];
+
 	if (!Ch->Active || ((Rd(C, PL330_CSR(Channel)) & 0xF) == 0)) return 0;
 
 	// Bytes left in this pass: find the fragment the memory side is in.
@@ -637,7 +672,8 @@ AddResourceGroup (
 		if (Desc == NULL) break;
 		if ((Desc->Header.Length < sizeof(PL330_CSRT_CONTROLLER)) || (Desc->BaseAddress == 0) ||
 		    (Desc->ChannelCount == 0) || (Desc->ChannelCount > PL330_MAX_CHANNELS) ||
-		    (Desc->RequestLineCount == 0) || (Desc->RequestLineCount > PL330_MAX_PERIPHERALS)) {
+		    (Desc->RequestLineCount == 0) || (Desc->RequestLineCount > PL330_MAX_PERIPHERALS) ||
+		    (Desc->ProgramBase == 0) || (Desc->ProgramSize < Desc->ChannelCount * PL330_PROGRAM_BYTES)) {
 			OsLog("halextpl330: bad PL330 controller descriptor\n");
 			continue;
 		}
@@ -649,6 +685,8 @@ AddResourceGroup (
 		Data.ChannelCount = Desc->ChannelCount;
 		Data.RequestLineBase = Desc->RequestLineBase;
 		Data.RequestLineCount = Desc->RequestLineCount;
+		Data.ProgramPhys = Desc->ProgramBase;
+		Data.ProgramSize = Desc->ProgramSize;
 		for (Index = 0; Index < PL330_MAX_PERIPHERALS; Index++) {
 			Data.PeripheralWidth[Index] = (Desc->PeripheralWidth[Index] != 0) ? Desc->PeripheralWidth[Index] : 4;
 		}
@@ -676,14 +714,16 @@ AddResourceGroup (
 			OsLogHex("halextpl330: controller registration failed ", (ULONG)Status);
 			continue;
 		}
+		// The HAL assigns its own controller id and writes it back here;
+		// channels name the controller by that id.
 
 		for (Index = 0; Index < Data.ChannelCount; Index++) {
 			RtlZeroMemory(&Channel, sizeof(Channel));
 			Channel.Header.TableVersion = 1;
 			Channel.Header.TableSize = sizeof(Channel);
-			Channel.ControllerId = Data.Id;
+			Channel.ControllerId = Controller.ControllerId;
 			Channel.GeneratesInterrupt = FALSE;      // the controller's line covers all channels
-			Channel.CommonBufferLength = PL330_PROGRAM_BYTES;
+			Channel.CommonBufferLength = 0;          // programs live in the firmware's range
 			Channel.ChannelNumber = Index;
 			Status = HextRegisterDmaChannel(Handle, ResourceGroup, (PVOID)&Channel);
 			if (!NT_SUCCESS(Status)) {

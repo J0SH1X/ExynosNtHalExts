@@ -50,8 +50,12 @@ HepRegisterResourceDescriptor(
 	return s_Imports->RegisterResourceDescriptor(Handle, ResourceGroup, &Header, Data);
 }
 
+// One UID counter for every descriptor type: the HAL treats a second
+// descriptor with the same resource group and UID as a duplicate
+// registration (bugcheck 0x5C, P1 0x300), whatever its type.
+static ULONG s_Uid = 0;
+
 #define REGISTER_RESOURCE_DESCRIPTOR(Type, Subtype, Data) do {\
-	static ULONG s_Uid = 0;\
 	RESOURCE_DESCRIPTOR_TYPES Types = { Type, Subtype };\
 	return HepRegisterResourceDescriptor(Handle, ResourceGroup, Types, &s_Uid, Data);\
 } while (0)
