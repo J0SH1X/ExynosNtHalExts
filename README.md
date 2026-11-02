@@ -34,3 +34,15 @@ Into a mounted image (e.g. `boot.wim`):
     dism /Image:<mount> /Add-Driver /Driver:halextmct.inf /ForceUnsigned
 
 and `bcdedit /set {default} testsigning on` in the BCD that boots it. `halextmct.reg` does the same registry change by hand (e.g. `hivexregedit --merge`).
+
+## halextpl330
+HAL extension for ARM PL330 DMA controllers (Exynos ADMA0 in the audio block; PDMA0/1 can be added): registers each controller the firmware describes as a Windows system DMA controller, so drivers use the normal DMA API (`FixedDMA` resources in ACPI, `IoGetDmaAdapter`, `MapTransferEx`; `AutoInitialize` for looping audio buffers, `ReadDmaCounter` for the position).
+
+CSRT resource group VendorId `SAMS`, DeviceId `0x0330` (`OSExtensionDatabase\VEN_SAMS&DEV_0330`):
+
+- one DMA controller descriptor (Type 3, Subtype 1) per PL330: base, size, GSI, channel count, the system-unique request line range and per peripheral the FIFO access width
+- optionally, in the group's shared info: version 1, base and size of the OS log ring
+
+The DMA extension interface is version 1 as Windows 8 RTM defines it (WDK `nthalext.h`); the DDK headers in this repository are older and their DMA definitions predate it, so `halextpl330.c` declares the version-1 layouts itself.  Controllers in a power domain that may be off at boot (ADMA0) are only touched once a driver programs a channel.
+
+Exynos5420Pkg (v1awifi) describes ADMA0 (`0x03880000`, GSI 142, request lines 0-4 = I2S0 TX, I2S0 secondary TX, I2S0 RX, PCM0 TX, PCM0 RX).  Built and installed like halextmct (`halextpl330/build.sh`, `halextpl330.inf` / `.reg`).  Not tested on the device yet.

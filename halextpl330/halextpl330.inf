@@ -1,0 +1,50 @@
+; HAL extension for ARM PL330 DMA controllers (Samsung Exynos ADMA0 / PDMA).
+; The firmware describes the controllers in a CSRT resource group
+; VendorId 'SAMS', DeviceId 0x0330.
+;
+;   dism /Image:<mount> /Add-Driver /Driver:halextpl330.inf /ForceUnsigned
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Computer
+ClassGuid={4d36e966-e325-11ce-bfc1-08002be10318}
+Provider=Exynos
+DriverVer=11/02/2026,1.0.0.0
+BootCritical=1
+PnPLockdown=1
+
+[ControlFlags]
+ExcludeFromSelect=*
+
+[DestinationDirs]
+DefaultDestDir = 11 ; DIRID_SYSTEM
+
+[SourceDisksNames]
+3426=windows cd
+
+[SourceDisksFiles]
+halextpl330.dll = 3426
+
+[Manufacturer]
+%MFGNAME% = DeviceList, NTARM
+
+[DeviceList.NTARM]
+%EXYNOS_PL330% = EXYNOS_PL330, ACPI\SAMS0330
+
+[EXYNOS_PL330]
+AddReg = EXYNOS_PL330_AddReg
+CopyFiles = EXYNOS_PL330_CopyFiles
+
+[EXYNOS_PL330_AddReg]
+HKLM,"%OSEDB%\VEN_SAMS&DEV_0330","HALExtension",,"halextpl330.dll"
+
+[EXYNOS_PL330_CopyFiles]
+halextpl330.dll
+
+[EXYNOS_PL330.Services]
+AddService = , 0x00000002
+
+[Strings]
+MFGNAME = "Samsung"
+EXYNOS_PL330 = "Exynos PL330 DMA controllers"
+OSEDB = "SYSTEM\CurrentControlSet\Control\OSExtensionDatabase"
